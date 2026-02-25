@@ -1,8 +1,8 @@
 # AGENTS.md: Directives for AI Contributors
 
-This repository enforces strict rules for AI agents contributing to hardware-linked software. The primary failure mode of previous iterations was the divergence between the AI's internal model of the system and the physical reality of the hardware.
+This repository enforces strict rules for AI agents contributing to hardware-linked software. The primary failure mode of previous iterations was the divergence between the AI's internal assumed model of the system and the physical reality of the hardware.
 
-You must adhere to the following directives when writing, refactoring, or reviewing code in this project.
+You must adhere to the following directives when writing, refactoring, or reviewing code in this project.  Assuming things will break things, all decisions must be derived from data.
 
 ## 1. Hardware Reality over Assumptions
 
@@ -13,13 +13,14 @@ Agents frequently make incorrect assumptions about physical connections, pinouts
 * **Battery Degradation:** The battery levels will change over time, so that will be hard to account for. Motor PWM outputs will yield less physical torque as voltage drops.
 * Swallowing an error is a crime.
 * Relaxing (like allowing mocks to the hardware) require explicit flags, the base case should require all hardware to work and fail loudly if not.
+* There are multiple levels of "things that change": The wiring (changes rarely), the physical build (changes infrequently), the tuning parameters (changes frequently).
 
 ## 2. Coordinate Systems and Directionality
 
 Debates over "which way is forward" consume unnecessary cycles and lead to sign-flip errors scattered across the codebase.
 
-* **Establish the Frame of Reference Once:** Define a single, explicit coordinate system (e.g., X is forward, Z is up) at the boundary of the application.
-* Assume any Gyros and Accelerometers aren't aligned with the frame of reference: They are likely mounted at an approximately right angle, but might be turned 90/180/270, or upside down and backwards.
+* **Establish the Frame of Reference Once:** Define a single, explicit coordinate system (e.g., positive X is forward, positive Z is up) at the boundary of the application.
+* Assume any Gyros and Accelerometers aren't aligned with the frame of reference: They are likely mounted at an approximately right angle, but might be turned 90/180/270, or upside down and/or backwards.
 * **Isolate Inversions:** All sensor inversions (e.g., IMU mounting orientation) and actuator inversions (e.g., motor wiring polarity) must be handled in exactly one place: the hardware abstraction layer. The core control logic must only deal in normalized, mathematically pure values. Do not let `-1` multipliers leak into the core control loops.
 
 ## 3. Architectural Rigor (DAGs and Pipelines)
@@ -34,7 +35,7 @@ Complex architectures are fragile. If introducing advanced execution models like
 
 LLMs cannot see the physical robot. When debugging, an LLM will invent a narrative about what is happening unless forced to look at data. This **must** be aggressively prevented.
 
-* **Log Actual Values:** Logging is not optional. You must log raw sensor inputs (without overloading the context window), filtered sensor values, target setpoints, intermediate controller terms (e.g., P, I, and D components separately), and the final output commands.
+* **Log Actual Values:** Logging is required. You must log raw sensor inputs (without overloading the context window), filtered sensor values, target setpoints, intermediate controller terms (e.g., P, I, and D components separately), and the final output commands.
 * **Do Not Guess Physics:** If a physical behavior is incorrect (e.g., the robot falls over or oscillates), do not rewrite the control logic based on a theoretical assumption. Request the log data first.
 
 ## 5. Defense in Depth
@@ -50,11 +51,11 @@ All numbers in this section (10 degress, 20 degrees, 10% power, etc) are assumpt
 
 1. The robot has two wheels of approximately the same radius and approximately the same motor power.  They are side-by-side.
 2. There isn't a defined "front" and "back" - pick one and assume the motors are randomly attached, and may not be facing the same way.
-3. The gyro is mounted in a near-right-angle, so if you are seeing a tilt more than 10 degrees, that means the robot is actually tilted.
-4. There are unusual features: This robot has "lean forward bumpers/training wheels" and "lean backwards bumpers/training wheels" that mostly keep it from falling completely over.  These are around 20 degrees, but aren't symmetrical. Note that **a 20-degree lean is a valid state, not a crash**.
-5. The robot can drive around on a bumper skidding on the ground, but this is like a toddler crawling.  Balancing on two wheels without using the bumpers after standing up is like the toddler walking (and toddlers love to walk!)
-6. The robot is strong enough that a hard acceleration from standstill (or maybe it requires a quick inversion of direction?) to "flop" from front to back bumper and vice-versa.  The strength needed is somewhere between 10% and 100%, but we aren't sure where.
-7. Before the PID is active, it will always be flopped forward or backwards, happily skidding around on the two wheels plus a front or back training wheel.
+3. The gyro is mounted in a near-right-angle, so if you are seeing a tilt more than ~10 degrees, that means the robot is actually tilted.
+4. There are unusual features: This robot has "lean forward bumpers/training wheels" and "lean backwards bumpers/training wheels" that mostly keep it from falling completely over.  These are around ~20 degrees, but aren't symmetrical. Note that **a lean is a valid state, not a crash**.
+5. The robot can drive around leaning on a bumper skidding on the ground, but this is like a toddler crawling.  Balancing on two wheels without using the bumpers after standing up is like the toddler walking (and toddlers love to walk!)
+6. The robot is strong enough that a hard acceleration from standstill (or maybe it requires a quick inversion of direction?) to "flop" from leaning on the front to back bumper and vice-versa.  The strength needed is somewhere around 50%, but may have massive variations.
+7. Before the PID is active, it will always be leaning forward or backwards, happily skidding around on the two wheels plus a front or back training wheel.
 8. Both gyro readings AND accelerometer readings are necessary to differentiate "spinning" from "tilting".
 9. **Crash State:** A tilt > 50 degrees is the true crash state requiring intervention. This only counts once the gyro's orientation is confidently determined.
 
@@ -63,28 +64,30 @@ All numbers in this section (10 degress, 20 degrees, 10% power, etc) are assumpt
 The agent "doesn't have all the answers" (Section 6), so it must use the scientific method to find them. **NEVER ASSUME OR GUESS THE HARDWARE.**
 
 * **Sequential Discovery:** Follow a strict 7-phase state machine that forces the LLM to run sequential, pessimistic physics experiments:
-    1. Spark of Life
-    2. Sense of Down
-    3. Stiction
-    4. Polarity
-    5. Left/Right
-    6. Trim
-    7. Balance Point
+    1. Arbitrary rules: Can we say "if you are starting from a blank slate, you always start out leaning on your rear bumper, which means you are leaning back ~20 degrees. This is by definition, the robot doesn't actually have a front and back"
+    2. What channels are the motors on?  The Gyro on? And are they verified?
+    3. Sense of Down: When at rest, what is "down" acceleration?
+    4. Stiction: How much power (in percent of max) do you need to sense **any** movement?
+    5. Polarity: Are the wheels facing the same way?  Oposite ways?
+    6. Left/Right: If you power just one wheel, which way do you turn? Is this enough to determine left vs. right (with "front" being defined earlier)?
+    7. Lean: How far are you leaning on the current bumper? Are you on the back bumper, or have you "flopped" to the front? How much different is the lean for each?
+    8. Trim: When you try to drive straight, do you end up curving?  Can you adjust the power to drive in a straight line?
+    9. Balance Point: Once we are highly confident we have "flopped" multiple times between the two resting positions (leaning back vs. leaning forward) we can assume the balance point is somewhere between the two. This ends our "crawling" phase, and we are ready to start to try to balance.
 * **Atomic Experiments:** If uncertain, write an atomic experiment, observe the result, deduce the fact, and save it.
 
 ## 8. Strict Data Structure Constraints
 
-* **Use `balance_bot.utils.Vector3`:** Always use `balance_bot.utils.Vector3` for 3D spatial data. It is an immutable NamedTuple. Do not use dictionaries or raw tuples. Enforcing a specific data structure prevents type errors and messy refactoring loops.
-* **Libraries:** `simple-pid` and `PyGLM` should be used.
+* **Use the same PyGLM based Vector3 for 3D spatial data. (Do not use dictionaries or raw tuples.) Enforcing a specific data structure prevents type errors and messy refactoring loops.
+* **Libraries:** `simple-pid` and `PyGLM` should be used whenever they simplify the code.
 
 ## 9. The "Do No Harm" Refactoring Rule
 
 * **Stateless Vacuum:** Process code in a "stateless vacuum," only applying changes that move the code to the target state.
 * **No Stylistic Changes:** Explicitly forbid stylistic changes for the sake of novelty. AI agents will often unnecessarily rewrite functional boilerplate or change variable names while trying to fix a bug, causing regressions in unrelated systems.
-* **Separation of Concerns:** Never mix doc updates with code updates. Lots of agents are working in parallel, and every "extra cleanup" causes a merge conflict.
+* **Separation of Concerns:** Never mix doc updates with code updates. Lots of agents are working in parallel, and every "extra cleanup" causes a merge conflict.  Stay focused!  If you encounter something bad, log it in a FUTURE_WORK.md file.
 
 ## 10. Tooling and Environment Directives
 
 * **Linting:** Run lint checks before commits using `uv run ruff check`.
 * **Testing:** Run tests using `uv run pytest`.
-* **Mocks:** If you are using `uv` or specific mock flags, the agent needs to know the exact CLI commands to test its own code. Use the `--allow-mocks` flag when necessary: `uv run pytest --allow-mocks`.
+* **Mocks:** If you are using `uv` or specific mock flags to simulate hardware that is unavalable to Jules, the agent needs to know the exact CLI commands to test its own code. Use the `--allow-mocks` flag when necessary: `uv run pytest --allow-mocks`.
