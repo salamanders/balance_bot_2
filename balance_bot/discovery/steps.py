@@ -320,9 +320,23 @@ class DriveTrimStep(CalibrationStep):
                 logger.info("[Deduction] Trim is perfectly acceptable.")
                 return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
-            # Proportional adjustment
-            new_trim = current_trim - (avg_z * kp)
-            new_trim = max(-0.5, min(0.5, new_trim))
+            # Proportional adjustment. 
+            # If Yaw Z is negative (e.g. -11.4), we are turning Right.
+            # This means the Left wheel is driving faster than the Right wheel.
+            # To fix this, we need to add positive trim to boost the Right wheel.
+            # new_trim = current_trim - (avg_z * kp)
+            # -11.4 * 0.05 = -0.57. current_trim - (-0.57) = +0.57.
+            # However, in our previous log, trim went to 0.500 and drift worsened to -42!
+            # This means positive trim actually *slows down* the Right wheel or boosts the Left wheel in set_motors.
+            # Let's check set_motors: 
+            # if trim > 0: right *= (1.0 - trim)
+            # So positive trim slows down the right wheel!
+            # If we are turning Right (negative Z), left is faster. We need to slow down Left.
+            # To slow down Left, trim must be negative.
+            # So new_trim = current_trim + (avg_z * kp)
+            
+            new_trim = current_trim + (avg_z * kp)
+            new_trim = max(-0.3, min(0.3, new_trim))
             
             if abs(new_trim - current_trim) < 0.001:
                 logger.info("[Deduction] Trim converged as best it can.")
@@ -348,20 +362,20 @@ class BalancePointStep(CalibrationStep):
         if state.lean_angle_front == 0.0:
             logger.info("[Action] We don't know the front lean angle. Attempting to flop the robot over.")
             
-            # Start at a reasonable power and ramp up until the pitch significantly changes
             base_power = state.min_power_visible + 20.0 
             
             for attempt in range(5):
-                power = base_power + (attempt * 15.0) # Ramp up power each try
+                power = base_power + (attempt * 15.0) 
                 if power > 100.0: power = 100.0
                 
                 logger.info(f"[Action] Flop attempt {attempt+1} at {power:.2f}% power...")
-                # Setup (rock back slightly), then Kick (drive forward hard)
+                # If pushing from a standstill fails to tip the robot over the center of mass, 
+                # accelerate in the opposite direction first, then violently reverse.
                 hw.execute_maneuver([
-                    (-power * 0.5, -power * 0.5, 0.3),
-                    (power, power, 0.5)
+                    (-power * 0.8, -power * 0.8, 0.4),
+                    (power, power, 0.7)
                 ])
-                time.sleep(1.0)
+                time.sleep(1.5)
                 
                 # Measure new pitch
                 res = hw.measure_only(1.0)
