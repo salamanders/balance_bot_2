@@ -1,10 +1,15 @@
 import time
-import glm
+import math
+import logging
 from typing import Tuple, Dict, Any, Optional
+
+import glm
 from ..configuration import HardwareConfig, LearningState
 from ..hardware.robot_hardware import RobotHardware
 from .protocol import CalibrationStep, StepStatus
 from ..utils import find_threshold
+
+logger = logging.getLogger(__name__)
 
 class InitialAssumptionStep(CalibrationStep):
     @property
@@ -14,14 +19,13 @@ class InitialAssumptionStep(CalibrationStep):
         return state.initial_assumptions_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Assumption: Robot starts leaning on back bumper (~20 deg)
-        print("Applying initial assumptions: Robot is leaning on BACK bumper.")
-
+        logger.info("[Deduction] Setting initial axiom: Robot is resting on rear bumper.")
         return StepStatus.SUCCESS, {}, {
             'initial_assumptions_verified': True,
             'current_bumper': 'back',
-            'lean_angle_back': 20.0 # Placeholder
+            'lean_angle_back': 20.0  # Safe initial assumption
         }
+
 
 class HardwareCheckStep(CalibrationStep):
     @property
@@ -31,26 +35,24 @@ class HardwareCheckStep(CalibrationStep):
         return state.hardware_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
+        logger.info("[Action] Pinging IMU for 0.1s to verify data stream.")
         try:
-            # Check IMU
             res = hw.drive_and_measure(0, 0, 0.1)
             if not res.samples:
-                print("Error: No IMU samples received.")
+                logger.error("[Deduction] FAILED: No IMU samples received. Check I2C wiring.")
                 return StepStatus.FATAL, {}, {}
 
-            # Check if values are sane (not all zeros)
-            # In mock, they might be zero, but we set mock to return gravity.
             first_sample = res.samples[0]
-            if glm.length(first_sample.accel_raw) == 0:
-                print("Warning: IMU returning zero vectors.")
-                # Allow retry or fail? Let's fail loudly as per spec.
+            if glm.length(first_sample.accel_raw) == 0.0:
+                logger.error("[Deduction] FAILED: IMU returning all zeros. Sensor is dead.")
                 return StepStatus.FATAL, {}, {}
 
+            logger.info("[Deduction] IMU is actively returning non-zero data.")
             return StepStatus.SUCCESS, {}, {'hardware_verified': True}
-
         except Exception as e:
-            print(f"Hardware check failed: {e}")
+            logger.error(f"[Deduction] FAILED: Hardware check exception: {e}")
             return StepStatus.FATAL, {}, {}
+
 
 class GravityCalibrationStep(CalibrationStep):
     @property
@@ -60,78 +62,72 @@ class GravityCalibrationStep(CalibrationStep):
         return state.gravity_vector_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Measure gravity while stationary
+        logger.info("[Action] Measuring gravity vector while stationary.")
         res = hw.drive_and_measure(0, 0, 1.0, wait_for_stability=True)
 
-        # Average accelerometer readings
         avg_accel = glm.vec3(0.0)
-        count = 0
         for s in res.samples:
             avg_accel += s.accel_raw
-            count += 1
-
-        if count == 0:
+        
+        if len(res.samples) == 0:
             return StepStatus.NEEDS_RETRY, {}, {}
-
-        avg_accel /= count
+            
+        avg_accel /= len(res.samples)
         mag = glm.length(avg_accel)
 
-        # Check if near 1g (9.81 m/s^2)
-        # Allow wide tolerance for cheap sensors/mocks
         if abs(mag - 9.81) > 2.0:
-            print(f"Gravity magnitude suspicious: {mag:.2f} (expected ~9.81)")
+            logger.warning(f"[Deduction] FAILED: Gravity magnitude suspicious ({mag:.2f}). Is robot moving?")
             return StepStatus.NEEDS_RETRY, {}, {}
 
+        logger.info(f"[Deduction] Gravity vector established: {avg_accel.x:.2f}, {avg_accel.y:.2f}, {avg_accel.z:.2f}")
         return StepStatus.SUCCESS, {}, {
             'gravity_vector_verified': True,
             'gravity_vector': avg_accel
         }
 
+
 class FrictionThresholdStep(CalibrationStep):
     @property
-    def name(self) -> str: return "Phase 4: Friction Threshold (Min Power)"
+    def name(self) -> str: return "Phase 4: Friction Threshold (Stiction)"
 
     def is_verified(self, state: LearningState) -> bool:
         return state.friction_threshold_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
+        logger.info("[Action] Ramping PWM to find minimum power for movement.")
+
         def action(p):
-            # Drive forward with power p
-            res = hw.drive_and_measure(p, p, 0.3, wait_for_stability=False)
-            time.sleep(0.5)
-            return res
+            return hw.drive_and_measure(p, p, 0.2, wait_for_stability=False)
 
         def check(res):
             max_mag = 0.0
             for s in res.samples:
-                # Check gyro magnitude (rotation)
-                # Note: If mock returns 0, this will fail unless we mock movement.
-                if s.gyro_raw: # Check if not None
-                    mag = glm.length(s.gyro_raw)
-                    if mag > max_mag: max_mag = mag
-            # Threshold: 15 deg/s (approx 0.26 rad/s)
-            # Assuming raw values are in deg/s or rad/s?
-            # Example says > 15.0, so likely deg/s.
-            return max_mag > 15.0
+                mag = glm.length(s.gyro_raw)
+                if mag > max_mag: 
+                    max_mag = mag
+            return max_mag > 15.0  # 15 deg/s or rad/s threshold
 
-        # Search for threshold starting at 10%, min 5%, max 100%
         found = find_threshold(
-            name="Minimum Power",
+            name="Stiction",
             initial=10.0,
             min_val=5.0,
             max_val=100.0,
             action_fn=action,
-            check_fn=check,
-            heartbeat_fn=lambda: hw.watchdog.heartbeat() if hw.watchdog else None
+            check_fn=check
         )
 
+        hw.stop()
+
         if found is None:
+            logger.error("[Deduction] FAILED: Could not overcome friction at 100% power.")
             return StepStatus.FATAL, {}, {}
 
+        logger.info(f"[Deduction] Stiction overcome at {found:.2f}% power.")
         return StepStatus.SUCCESS, {}, {
             'min_power_visible': found,
             'friction_threshold_verified': True
         }
+
 
 class MotorPolarityStep(CalibrationStep):
     @property
@@ -141,82 +137,54 @@ class MotorPolarityStep(CalibrationStep):
         return state.polarity_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Drive both motors forward
-        power = state.min_power_visible * 1.5
+        power = state.min_power_visible + 15.0
+        logger.info(f"[Action] Pulsing motors at {power:.2f}% to check for rotation vs translation.")
+        
         res = hw.drive_and_measure(power, power, 0.5, wait_for_stability=True)
+        hw.stop()
 
-        # Analyze:
-        # If aligned: High accel (or velocity), Low rotation
-        # If opposed: Low accel, High rotation
+        avg_gyro_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
 
-        avg_gyro_z = 0.0
-        avg_accel_x = 0.0 # Assuming X is forward?
-        count = 0
-        for s in res.samples:
-            avg_gyro_z += s.gyro_raw.z
-            avg_accel_x += s.accel_raw.x # This might need coordinate transform
-            count += 1
-
-        if count == 0: return StepStatus.NEEDS_RETRY, {}, {}
-
-        avg_gyro_z /= count
-        avg_accel_x /= count
-
-        # Thresholds (need tuning)
-        ROTATION_THRESHOLD = 0.5 # rad/s
-
-        if abs(avg_gyro_z) > ROTATION_THRESHOLD:
-            print(f"High rotation detected ({avg_gyro_z:.2f}). Motors might be opposed.")
-            # In a real scenario, we might swap a channel in config
-            # config.motor_right_channel = -config.motor_right_channel ?
-            # For now, just fail or flag it.
-            return StepStatus.FATAL, {}, {'wheels_reversed': True}
-
+        # If applying equal positive power results in significant yaw, motors are opposed
+        if abs(avg_gyro_z) > 1.0: # high threshold
+            logger.info(f"[Deduction] Motors are fighting each other! Detected Yaw: {avg_gyro_z:.2f}. Inverting right motor.")
+            return StepStatus.SUCCESS, {'motor_right_invert': not config.motor_right_invert}, {}
+            
+        logger.info("[Deduction] Motors are pushing together.")
         return StepStatus.SUCCESS, {}, {'polarity_verified': True, 'wheels_reversed': False}
+
 
 class TurnDirectionStep(CalibrationStep):
     @property
-    def name(self) -> str: return "Phase 6: Turn Direction (Left/Right)"
+    def name(self) -> str: return "Phase 6: Turn Direction"
 
     def is_verified(self, state: LearningState) -> bool:
         return state.turn_direction_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        power = state.min_power_visible * 1.5
-
-        # Test Left Wheel
+        power = state.min_power_visible + 15.0
+        
+        logger.info("[Action] Driving left wheel to observe rotation.")
         res_l = hw.drive_and_measure(power, 0, 0.5, wait_for_stability=True)
-        # Expect turn to RIGHT (negative Yaw?)
-
-        # Test Right Wheel
+        hw.stop()
+        
+        logger.info("[Action] Driving right wheel to observe rotation.")
         res_r = hw.drive_and_measure(0, power, 0.5, wait_for_stability=True)
-        # Expect turn to LEFT (positive Yaw?)
+        hw.stop()
 
-        # Analyze Gyro Z
-        def get_avg_z(samples):
-            return sum(s.gyro_raw.z for s in samples) / len(samples) if samples else 0.0
+        z_l = sum(s.gyro_raw.z for s in res_l.samples) / max(len(res_l.samples), 1)
+        z_r = sum(s.gyro_raw.z for s in res_r.samples) / max(len(res_r.samples), 1)
 
-        z_l = get_avg_z(res_l.samples)
-        z_r = get_avg_z(res_r.samples)
+        logger.info(f"[Observation] Left wheel alone -> Gyro Z: {z_l:.2f}")
+        logger.info(f"[Observation] Right wheel alone -> Gyro Z: {z_r:.2f}")
 
-        print(f"Left Wheel Drive -> Gyro Z: {z_l:.2f}")
-        print(f"Right Wheel Drive -> Gyro Z: {z_r:.2f}")
-
-        # Verify they are opposite signs and significant
-        if abs(z_l) < 0.1 or abs(z_r) < 0.1:
-            print("Turn response too weak.")
-            return StepStatus.NEEDS_RETRY, {}, {}
-
-        if (z_l * z_r) > 0:
-            print("Both wheels turn in same direction? Wiring error.")
+        if (z_l * z_r) > 0 and abs(z_l) > 0.1 and abs(z_r) > 0.1:
+            logger.error("[Deduction] FAILED: Both wheels turn the robot the same way. Wiring is seriously wrong.")
             return StepStatus.FATAL, {}, {}
 
-        # If logic is inverted (Left wheel makes it turn Left), swap config?
-        # Standard: Left wheel pushes Right side forward -> Turn Right (-Z).
-        # But if 'Forward' is X, Left wheel at +Y...
-        # Let's assume standard differential drive.
-
+        logger.info("[Deduction] Differential drive is confirmed functional.")
         return StepStatus.SUCCESS, {}, {'turn_direction_verified': True}
+
 
 class LeanCharacterizationStep(CalibrationStep):
     @property
@@ -226,23 +194,17 @@ class LeanCharacterizationStep(CalibrationStep):
         return state.lean_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Measure gravity vector again
+        logger.info("[Action] Measuring static lean angle on current bumper.")
         res = hw.drive_and_measure(0, 0, 1.0, wait_for_stability=True)
 
-        # Calculate pitch from gravity
-        # Pitch = atan2(accel.x, accel.z) usually (assuming Y is axle)
-
         avg_accel = glm.vec3(0.0)
-        for s in res.samples: avg_accel += s.accel_raw
-        if res.samples: avg_accel /= len(res.samples)
+        for s in res.samples: 
+            avg_accel += s.accel_raw
+        if res.samples: 
+            avg_accel /= len(res.samples)
 
-        # Simple pitch calculation
-        # This depends on IMU orientation. Assuming Z is 'up' in robot frame?
-        # If robot is leaning back, Z and X components change.
-        import math
-        pitch = math.degrees(math.atan2(avg_accel.x, avg_accel.z))
-
-        print(f"Measured Pitch: {pitch:.2f} degrees")
+        pitch = math.degrees(math.atan2(avg_accel.y, avg_accel.z))
+        logger.info(f"[Deduction] Measured static pitch is {pitch:.2f} degrees.")
 
         updates = {'lean_verified': True}
         if state.current_bumper == 'back':
@@ -252,6 +214,7 @@ class LeanCharacterizationStep(CalibrationStep):
 
         return StepStatus.SUCCESS, {}, updates
 
+
 class DriveTrimStep(CalibrationStep):
     @property
     def name(self) -> str: return "Phase 8: Drive Trim"
@@ -260,43 +223,30 @@ class DriveTrimStep(CalibrationStep):
         return state.trim_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Try to drive straight
-        power = state.min_power_visible * 1.5
-
-        # We want to find a trim that minimizes Gyro Z
-        # We will loop internally to find the best trim
-
-        def measure_drift(trim):
-            res = hw.drive_and_measure(power, power, 0.5, wait_for_stability=True, trim_override=trim)
-            # Calculate avg Gyro Z
-            avg_z = sum(s.gyro_raw.z for s in res.samples) / len(res.samples) if res.samples else 0.0
-            return avg_z
-
+        power = state.min_power_visible + 15.0
         current_trim = config.trim_bias
-        kp = 0.05 # Gain
+        
+        logger.info(f"[Action] Searching for zero-drift straight line trim starting at {current_trim:.3f}")
 
-        for attempt in range(5): # Max attempts
-            current_drift = measure_drift(current_trim)
-            print(f"Drift at trim ({current_trim:.3f}): {current_drift:.2f}")
+        res = hw.drive_and_measure(power, power, 0.5, wait_for_stability=True, trim_override=current_trim)
+        hw.stop()
+        
+        avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+        
+        logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
+        
+        if abs(avg_z) < 0.2:
+            logger.info("[Deduction] Trim is perfectly acceptable.")
+            return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
-            if abs(current_drift) < 0.1: # Threshold
-                return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
+        # Small proportional adjustment for the next loop run
+        kp = 0.05
+        new_trim = current_trim - (avg_z * kp)
+        new_trim = max(-0.5, min(0.5, new_trim))
+        
+        logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f}. Will re-test.")
+        return StepStatus.SUCCESS, {'trim_bias': new_trim}, {} # NOT setting verified so it loops
 
-            # Adjust trim
-            new_trim = current_trim - (current_drift * kp)
-
-            # Limit trim
-            new_trim = max(-0.5, min(0.5, new_trim))
-
-            if abs(new_trim - current_trim) < 0.001:
-                print("Trim converged (or stuck).")
-                break
-
-            current_trim = new_trim
-
-        # If we exit loop, we either converged or failed to perfect it.
-        # But we return the best we have.
-        return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
 class BalancePointStep(CalibrationStep):
     @property
@@ -306,20 +256,27 @@ class BalancePointStep(CalibrationStep):
         return state.balance_point_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        # Assume we have lean_angle_back and lean_angle_front
-        # (In a real run, we would need to prompt user to flip robot or drive to flip it)
-
-        if state.lean_angle_front == 0.0 and state.lean_angle_back != 0.0:
-             # We haven't measured front lean yet.
-             print("Please flip robot to front bumper (or implement flop maneuver).")
-             # For now, just assume symmetric or fail
-             # return StepStatus.FATAL, {}, {}
-
-             # Let's mock it for the sake of the protocol finishing
-             state.lean_angle_front = -state.lean_angle_back
-
+        # Need both leans
+        if state.lean_angle_front == 0.0:
+            logger.info("[Action] We don't know the front lean angle. Flop the robot over.")
+            # Simple Flop Maneuver
+            power = state.min_power_visible + 30.0 
+            hw.drive_and_measure(power, power, 0.7, wait_for_stability=True)
+            hw.stop()
+            time.sleep(1.0)
+            
+            # Now we are on the front bumper
+            res = hw.drive_and_measure(0, 0, 1.0, wait_for_stability=True)
+            avg_accel = glm.vec3(0.0)
+            for s in res.samples: avg_accel += s.accel_raw
+            if res.samples: avg_accel /= len(res.samples)
+            pitch = math.degrees(math.atan2(avg_accel.y, avg_accel.z))
+            
+            logger.info(f"[Deduction] Flopped to front bumper. Measured pitch is {pitch:.2f} degrees.")
+            return StepStatus.SUCCESS, {}, {'lean_angle_front': pitch, 'current_bumper': 'front'}
+            
         balance_angle = (state.lean_angle_back + state.lean_angle_front) / 2.0
-        print(f"Calculated Balance Point: {balance_angle:.2f}")
+        logger.info(f"[Deduction] Balance point calculated exactly midway between bumpers: {balance_angle:.2f} degrees.")
 
         return StepStatus.SUCCESS, {}, {
             'balance_point_verified': True,

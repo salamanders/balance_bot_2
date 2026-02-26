@@ -5,8 +5,13 @@ class HardwareConfig(BaseModel):
     """
     Configuration for the robot hardware.
     """
-    motor_left_channel: int = 1
-    motor_right_channel: int = 2
+    imu_i2c_bus: Optional[int] = None
+    motor_i2c_bus: Optional[int] = None
+
+    motor_left_channel: Optional[int] = None
+    motor_right_channel: Optional[int] = None
+    motor_left_invert: bool = False
+    motor_right_invert: bool = False
 
     gyro_offset_x: float = 0.0
     gyro_offset_y: float = 0.0
