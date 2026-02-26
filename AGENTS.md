@@ -44,6 +44,8 @@ Hardware requires failsafes. Code that works perfectly in a test suite will fail
 
 * **Fail Loud and Fast:** If a critical sensor stops responding or a constraint is violated (e.g., max tilt angle exceeded), the system must immediately disarm actuators and halt.
 * **State Machine Boundaries:** If using state machines for behavior, ensure transition conditions are mutually exclusive and logically complete. Undefined states in hardware lead to physical damage.
+* **I2C Brownouts (Errno 5):** Sudden motor power spikes (e.g., kicking past 30-40% instantaneously) can cause severe interference or voltage drops on the I2C bus, crashing sensor reads (`[Errno 5] Input/output error`). Operations that require large physical forces (like the Flop maneuver) must account for this, allowing time for the bus to recover or ramping power instead of spiking it.
+* **Angular Wrap-Around:** Pitch math must use shortest-path circular difference to handle the 180/-180 degree boundary. Do not use naive subtraction (e.g., `abs(162 - (-179))`) when measuring physical changes in tilt, as it will cause false positives for large movements.
 
 ## 6. You don't have all the answers, but you know some things to be true
 

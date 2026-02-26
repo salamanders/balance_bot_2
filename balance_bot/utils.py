@@ -1,5 +1,18 @@
 from typing import Callable, Any, Optional
 import time
+import math
+
+def shortest_angular_distance(angle1: float, angle2: float) -> float:
+    """
+    Calculates the shortest distance between two angles in degrees.
+    Handles the wrap-around at 180 / -180.
+    """
+    diff = (angle2 - angle1) % 360.0
+    if diff > 180.0:
+        diff -= 360.0
+    elif diff < -180.0:
+        diff += 360.0
+    return diff
 
 def find_threshold(
     name: str,

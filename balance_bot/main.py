@@ -30,13 +30,11 @@ def main():
     hw = RobotHardware(config)
 
     # Run Discovery Pipeline
-    print("
---- Starting Tabula Rasa Discovery ---")
+    print("\n--- Starting Tabula Rasa Discovery ---")
     pipeline = SelfDiscoveryPipeline(hw, config, state)
     pipeline.run()
     
-    print("
-=== All systems go! ===")
+    print("\n=== All systems go! ===")
 
 if __name__ == "__main__":
     main()

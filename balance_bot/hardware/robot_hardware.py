@@ -41,6 +41,9 @@ class RobotHardware:
         """Updates the hardware configuration."""
         self.config = config
         logger.info(f"Applied new configuration: {config}")
+        
+        if self.pz is None or self.sensor is None:
+            self.initialize_drivers()
 
     def initialize_drivers(self):
         """Initializes the PiconZero and MPU6050 drivers."""
@@ -105,6 +108,59 @@ class RobotHardware:
             logger.error(f"IMU reading failed: {e}")
             raise RuntimeError(f"IMU Hardware failure: {e}")
 
+    def test_motor_channel(self, channel: int, power: float, duration: float, sample_interval: float = 0.01) -> MeasureResult:
+        """Applies power to a specific raw PiconZero channel for testing without configuration dependencies."""
+        if self.pz is None:
+            raise RuntimeError("Motor driver not initialized")
+
+        power_val = int(max(min(power, MOTOR_MAX_OUTPUT), MOTOR_MIN_OUTPUT))
+        logger.debug(f"Direct Channel Test - Channel: {channel}, Power: {power_val}")
+
+        samples = []
+        start_time = time.time()
+        end_time = start_time + duration
+
+        self.pz.set_motor(channel, power_val)
+
+        while time.time() < end_time:
+            try:
+                accel, gyro = self.read_imu_raw()
+                reading = IMUReading(timestamp=time.time(), gyro_raw=gyro, accel_raw=accel)
+                samples.append(reading)
+            except Exception as e:
+                pass
+            time.sleep(sample_interval)
+
+        self.pz.stop()
+        return MeasureResult(duration=duration, samples=samples)
+
+    def test_raw_motors(self, power_0: float, power_1: float, duration: float, sample_interval: float = 0.01) -> MeasureResult:
+        """Applies power to specific raw PiconZero channels 0 and 1 for testing."""
+        if self.pz is None:
+            raise RuntimeError("Motor driver not initialized")
+
+        val_0 = int(max(min(power_0, MOTOR_MAX_OUTPUT), MOTOR_MIN_OUTPUT))
+        val_1 = int(max(min(power_1, MOTOR_MAX_OUTPUT), MOTOR_MIN_OUTPUT))
+        logger.debug(f"Direct Raw Motors Test - Ch0: {val_0}, Ch1: {val_1}")
+
+        samples = []
+        start_time = time.time()
+        end_time = start_time + duration
+
+        self.pz.set_motors(val_0, val_1)
+
+        while time.time() < end_time:
+            try:
+                accel, gyro = self.read_imu_raw()
+                reading = IMUReading(timestamp=time.time(), gyro_raw=gyro, accel_raw=accel)
+                samples.append(reading)
+            except Exception as e:
+                pass
+            time.sleep(sample_interval)
+
+        self.pz.stop()
+        return MeasureResult(duration=duration, samples=samples)
+
     def set_motors(self, left: float, right: float, trim_override: Optional[float] = None) -> None:
         """Sets motor speeds considering configuration (channels, inversions, trim)."""
         if self.pz is None:
@@ -157,6 +213,24 @@ class RobotHardware:
         """
         logger.info("Waiting for stability...")
         time.sleep(0.5)
+
+    def measure_only(self, duration: float, sample_interval: float = 0.01) -> MeasureResult:
+        """Records IMU data for a duration without touching motors."""
+        samples = []
+        start_time = time.time()
+        end_time = start_time + duration
+
+        while time.time() < end_time:
+            try:
+                accel, gyro = self.read_imu_raw()
+                logger.debug(f"Sensor Read - Accel: ({accel.x:.2f}, {accel.y:.2f}, {accel.z:.2f}), Gyro: ({gyro.x:.2f}, {gyro.y:.2f}, {gyro.z:.2f})")
+                reading = IMUReading(timestamp=time.time(), gyro_raw=gyro, accel_raw=accel)
+                samples.append(reading)
+            except Exception as e:
+                logger.warning(f"Failed to read IMU during measure_only: {e}")
+            time.sleep(sample_interval)
+
+        return MeasureResult(duration=duration, samples=samples)
 
     def execute_maneuver(self, maneuver: List[Tuple[float, float, float]], sample_interval: float = 0.01, trim_override: Optional[float] = None) -> MeasureResult:
         """

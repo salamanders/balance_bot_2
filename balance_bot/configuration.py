@@ -27,6 +27,9 @@ class LearningState(BaseModel):
     """
     State tracking for the discovery process.
     """
+    # Phase 0: Bus Discovery
+    buses_discovered: bool = False
+
     # Phase 1: Initial Assumptions
     initial_assumptions_verified: bool = False
 

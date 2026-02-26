@@ -4,6 +4,7 @@ from ..configuration import HardwareConfig, LearningState
 from ..hardware.robot_hardware import RobotHardware
 from .protocol import CalibrationStep, StepStatus
 from .steps import (
+    DiscoverBusesStep,
     InitialAssumptionStep,
     HardwareCheckStep,
     GravityCalibrationStep,
@@ -21,6 +22,7 @@ class SelfDiscoveryPipeline:
         self.config = config
         self.state = state
         self.steps: List[CalibrationStep] = [
+            DiscoverBusesStep(),
             InitialAssumptionStep(),
             HardwareCheckStep(),
             GravityCalibrationStep(),

@@ -7,9 +7,73 @@ import glm
 from ..configuration import HardwareConfig, LearningState
 from ..hardware.robot_hardware import RobotHardware
 from .protocol import CalibrationStep, StepStatus
-from ..utils import find_threshold
+from ..utils import find_threshold, shortest_angular_distance
 
 logger = logging.getLogger(__name__)
+
+class DiscoverBusesStep(CalibrationStep):
+    @property
+    def name(self) -> str: return "Phase 0: Discover I2C Buses"
+
+    def is_verified(self, state: LearningState) -> bool:
+        return state.buses_discovered
+
+    def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
+        import os
+        if os.environ.get("ALLOW_MOCK_FALLBACK"):
+            logger.info("[Deduction] Mocks allowed. Skipping I2C bus scan.")
+            return StepStatus.SUCCESS, {'motor_i2c_bus': 1, 'imu_i2c_bus': 1}, {'buses_discovered': True}
+
+        logger.info("[Action] Scanning I2C buses (1 and 3) for IMU (0x68) and Motor Driver (0x22).")
+        try:
+            import smbus2 as smbus
+        except ImportError:
+            logger.error("[Deduction] FAILED: smbus2 not installed.")
+            return StepStatus.FATAL, {}, {}
+
+        found_imu = None
+        found_motor = None
+
+        for bus_id in [1, 3]:
+            try:
+                bus = smbus.SMBus(bus_id)
+                
+                # Check for IMU (0x68)
+                if found_imu is None:
+                    try:
+                        bus.read_byte(0x68)
+                        found_imu = bus_id
+                        logger.info(f"[Observation] Found IMU at 0x68 on bus {bus_id}")
+                    except OSError:
+                        pass
+                
+                # Check for Motor Driver (0x22)
+                if found_motor is None:
+                    try:
+                        bus.read_byte(0x22)
+                        found_motor = bus_id
+                        logger.info(f"[Observation] Found Motor Driver at 0x22 on bus {bus_id}")
+                    except OSError:
+                        pass
+                        
+                bus.close()
+            except Exception:
+                pass
+        
+        if found_imu is None or found_motor is None:
+            logger.error("[Deduction] FAILED: Could not find both devices. Check wiring.")
+            return StepStatus.FATAL, {}, {}
+
+        logger.info(f"[Deduction] Configured IMU on bus {found_imu} and Motor Driver on bus {found_motor}.")
+        # We assign Left=0 and Right=1 as an initial working hypothesis. 
+        # TurnDirectionStep will verify this and swap them if the hypothesis is wrong.
+        return StepStatus.SUCCESS, {
+            'motor_i2c_bus': found_motor, 
+            'imu_i2c_bus': found_imu,
+            'motor_left_channel': 0,
+            'motor_right_channel': 1
+        }, {'buses_discovered': True}
+
 
 class InitialAssumptionStep(CalibrationStep):
     @property
@@ -141,8 +205,7 @@ class MotorPolarityStep(CalibrationStep):
         logger.info(f"[Action] Pulsing motors at {power:.2f}% to check for rotation vs translation.")
         
         res = hw.drive_and_measure(power, power, 0.5, wait_for_stability=True)
-        hw.stop()
-
+        
         avg_gyro_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
 
         # If applying equal positive power results in significant yaw, motors are opposed
@@ -166,11 +229,9 @@ class TurnDirectionStep(CalibrationStep):
         
         logger.info("[Action] Driving left wheel to observe rotation.")
         res_l = hw.drive_and_measure(power, 0, 0.5, wait_for_stability=True)
-        hw.stop()
         
         logger.info("[Action] Driving right wheel to observe rotation.")
         res_r = hw.drive_and_measure(0, power, 0.5, wait_for_stability=True)
-        hw.stop()
 
         z_l = sum(s.gyro_raw.z for s in res_l.samples) / max(len(res_l.samples), 1)
         z_r = sum(s.gyro_raw.z for s in res_r.samples) / max(len(res_r.samples), 1)
@@ -182,8 +243,26 @@ class TurnDirectionStep(CalibrationStep):
             logger.error("[Deduction] FAILED: Both wheels turn the robot the same way. Wiring is seriously wrong.")
             return StepStatus.FATAL, {}, {}
 
-        logger.info("[Deduction] Differential drive is confirmed functional.")
-        return StepStatus.SUCCESS, {}, {'turn_direction_verified': True}
+        # Assuming positive Z is turning left (Right Hand Rule on Z Up).
+        # A wheel pushing forward that turns robot left (Positive Z) is the RIGHT wheel.
+        # A wheel pushing forward that turns robot right (Negative Z) is the LEFT wheel.
+        # Currently, config.motor_left_channel was driven for res_l.
+        # If z_l > 0, the "left" wheel turned the robot left, which means it is actually the RIGHT wheel!
+        
+        updates = {'turn_direction_verified': True}
+        config_updates = {}
+        
+        if z_l > 0:
+            logger.info("[Deduction] The currently assigned Left wheel turned the robot left. It is actually the Right wheel. Swapping channels.")
+            config_updates['motor_left_channel'] = config.motor_right_channel
+            config_updates['motor_right_channel'] = config.motor_left_channel
+            # We must also swap their inversion states!
+            config_updates['motor_left_invert'] = config.motor_right_invert
+            config_updates['motor_right_invert'] = config.motor_left_invert
+        else:
+            logger.info("[Deduction] Turn directions align with Left/Right assumptions. No swap needed.")
+
+        return StepStatus.SUCCESS, config_updates, updates
 
 
 class LeanCharacterizationStep(CalibrationStep):
@@ -228,24 +307,33 @@ class DriveTrimStep(CalibrationStep):
         
         logger.info(f"[Action] Searching for zero-drift straight line trim starting at {current_trim:.3f}")
 
-        res = hw.drive_and_measure(power, power, 0.5, wait_for_stability=True, trim_override=current_trim)
-        hw.stop()
-        
-        avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
-        
-        logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
-        
-        if abs(avg_z) < 0.2:
-            logger.info("[Deduction] Trim is perfectly acceptable.")
-            return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
-
-        # Small proportional adjustment for the next loop run
         kp = 0.05
-        new_trim = current_trim - (avg_z * kp)
-        new_trim = max(-0.5, min(0.5, new_trim))
         
-        logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f}. Will re-test.")
-        return StepStatus.SUCCESS, {'trim_bias': new_trim}, {} # NOT setting verified so it loops
+        for attempt in range(5):
+            hw.wait_for_stability()
+            res = hw.drive_and_measure(power, power, 0.5, trim_override=current_trim)
+            
+            avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+            logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
+            
+            if abs(avg_z) < 0.2:
+                logger.info("[Deduction] Trim is perfectly acceptable.")
+                return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
+
+            # Proportional adjustment
+            new_trim = current_trim - (avg_z * kp)
+            new_trim = max(-0.5, min(0.5, new_trim))
+            
+            if abs(new_trim - current_trim) < 0.001:
+                logger.info("[Deduction] Trim converged as best it can.")
+                break
+                
+            current_trim = new_trim
+            logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f} for next attempt.")
+            time.sleep(0.5)
+            
+        logger.warning(f"[Deduction] Exhausted trim attempts. Settling on {current_trim:.3f}")
+        return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
 
 class BalancePointStep(CalibrationStep):
@@ -258,24 +346,47 @@ class BalancePointStep(CalibrationStep):
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
         # Need both leans
         if state.lean_angle_front == 0.0:
-            logger.info("[Action] We don't know the front lean angle. Flop the robot over.")
-            # Simple Flop Maneuver
-            power = state.min_power_visible + 30.0 
-            hw.drive_and_measure(power, power, 0.7, wait_for_stability=True)
-            hw.stop()
-            time.sleep(1.0)
+            logger.info("[Action] We don't know the front lean angle. Attempting to flop the robot over.")
             
-            # Now we are on the front bumper
-            res = hw.drive_and_measure(0, 0, 1.0, wait_for_stability=True)
-            avg_accel = glm.vec3(0.0)
-            for s in res.samples: avg_accel += s.accel_raw
-            if res.samples: avg_accel /= len(res.samples)
-            pitch = math.degrees(math.atan2(avg_accel.y, avg_accel.z))
+            # Start at a reasonable power and ramp up until the pitch significantly changes
+            base_power = state.min_power_visible + 20.0 
             
-            logger.info(f"[Deduction] Flopped to front bumper. Measured pitch is {pitch:.2f} degrees.")
-            return StepStatus.SUCCESS, {}, {'lean_angle_front': pitch, 'current_bumper': 'front'}
+            for attempt in range(5):
+                power = base_power + (attempt * 15.0) # Ramp up power each try
+                if power > 100.0: power = 100.0
+                
+                logger.info(f"[Action] Flop attempt {attempt+1} at {power:.2f}% power...")
+                # Setup (rock back slightly), then Kick (drive forward hard)
+                hw.execute_maneuver([
+                    (-power * 0.5, -power * 0.5, 0.3),
+                    (power, power, 0.5)
+                ])
+                time.sleep(1.0)
+                
+                # Measure new pitch
+                res = hw.measure_only(1.0)
+                avg_accel = glm.vec3(0.0)
+                for s in res.samples: avg_accel += s.accel_raw
+                if res.samples: avg_accel /= len(res.samples)
+                new_pitch = math.degrees(math.atan2(avg_accel.y, avg_accel.z))
+                
+                # Did we actually flop? We need to have moved significantly from the back bumper
+                pitch_diff = abs(shortest_angular_distance(state.lean_angle_back, new_pitch))
+                logger.info(f"[Observation] New pitch is {new_pitch:.2f} degrees (Difference: {pitch_diff:.2f})")
+                
+                if pitch_diff > 15.0: # Significant change indicates it landed on the other bumper
+                    logger.info(f"[Deduction] Successfully flopped to front bumper. Measured pitch is {new_pitch:.2f} degrees.")
+                    return StepStatus.SUCCESS, {}, {'lean_angle_front': new_pitch, 'current_bumper': 'front'}
             
-        balance_angle = (state.lean_angle_back + state.lean_angle_front) / 2.0
+            logger.error("[Deduction] FAILED: Could not flop the robot over even at max power.")
+            return StepStatus.FATAL, {}, {}
+            
+        # We need to average the two leans safely around the circle
+        # e.g., averaging 170 and -170 should be 180, not 0.
+        diff = shortest_angular_distance(state.lean_angle_back, state.lean_angle_front)
+        balance_angle = (state.lean_angle_back + (diff / 2.0)) % 360.0
+        if balance_angle > 180.0: balance_angle -= 360.0
+        
         logger.info(f"[Deduction] Balance point calculated exactly midway between bumpers: {balance_angle:.2f} degrees.")
 
         return StepStatus.SUCCESS, {}, {
