@@ -89,8 +89,10 @@ The agent "doesn't have all the answers" (Section 6), so it must use the scienti
 * **No Stylistic Changes:** Explicitly forbid stylistic changes for the sake of novelty. AI agents will often unnecessarily rewrite functional boilerplate or change variable names while trying to fix a bug, causing regressions in unrelated systems.
 * **Separation of Concerns:** Never mix doc updates with code updates. Lots of agents are working in parallel, and every "extra cleanup" causes a merge conflict.  Stay focused!  If you encounter something bad, log it in a FUTURE_WORK.md file.
 
-## 10. Tooling and Environment Directives
+## 11. Strict Personal Operational Constraints for AI
 
-* **Linting:** Run lint checks before commits using `uv run ruff check`.
-* **Testing:** Run tests using `uv run pytest`.
-* **Mocks:** If you are using `uv` or specific mock flags to simulate hardware that is unavalable to Jules, the agent needs to know the exact CLI commands to test its own code. Use the `--allow-mocks` flag when necessary: `uv run pytest --allow-mocks`.
+AI agents working on this codebase must adhere to the following strict personal operational constraints:
+
+1. **Assume My Math is Wrong:** Until I see a log proving that a change in `x` resulted in the expected change in `y`, I will assume my signs, axes, and multipliers are backwards.
+2. **No "Best Effort" Fallbacks:** I will stop writing code that says "We exhausted attempts, settling for [garbage value]". If a physical calibration doesn't meet a strict mathematical threshold, it must fail fatally. Proceeding with bad data invalidates the entire pipeline.
+3. **Data Literalism:** If the log says the robot is spinning at 42 degrees a second, it is spinning. I will not invent a narrative. I will read the code that led to that exact motor output and fix the equation.

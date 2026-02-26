@@ -367,10 +367,11 @@ class BalancePointStep(CalibrationStep):
                 
                 logger.info(f"[Action] Flop attempt {attempt+1} at {power:.2f}% power...")
                 # If pushing from a standstill fails to tip the robot over the center of mass, 
-                # accelerate in the opposite direction first, then violently reverse.
+                # accelerate into the current bumper first (forward power to pitch back), 
+                # then violently reverse (backward power to pitch forward).
                 hw.execute_maneuver([
-                    (-power * 0.8, -power * 0.8, 0.4),
-                    (power, power, 0.7)
+                    (power * 0.8, power * 0.8, 0.4),
+                    (-power, -power, 0.7)
                 ])
                 time.sleep(1.5)
                 
