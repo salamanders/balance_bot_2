@@ -307,46 +307,43 @@ class DriveTrimStep(CalibrationStep):
         
         logger.info(f"[Action] Searching for zero-drift straight line trim starting at {current_trim:.3f}")
 
-        kp = 0.05
+        kp = 0.02  # Lower gain to prevent wild oscillation
         
-        for attempt in range(5):
+        for attempt in range(10):  # More attempts to converge
             hw.wait_for_stability()
             res = hw.drive_and_measure(power, power, 0.5, trim_override=current_trim)
             
             avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
             logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
             
-            if abs(avg_z) < 0.2:
+            if abs(avg_z) < 2.0:  # Relaxed acceptable threshold to 2.0 deg/s
                 logger.info("[Deduction] Trim is perfectly acceptable.")
                 return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
             # Proportional adjustment. 
             # If Yaw Z is negative (e.g. -11.4), we are turning Right.
             # This means the Left wheel is driving faster than the Right wheel.
-            # To fix this, we need to add positive trim to boost the Right wheel.
-            # new_trim = current_trim - (avg_z * kp)
-            # -11.4 * 0.05 = -0.57. current_trim - (-0.57) = +0.57.
-            # However, in our previous log, trim went to 0.500 and drift worsened to -42!
-            # This means positive trim actually *slows down* the Right wheel or boosts the Left wheel in set_motors.
-            # Let's check set_motors: 
-            # if trim > 0: right *= (1.0 - trim)
-            # So positive trim slows down the right wheel!
-            # If we are turning Right (negative Z), left is faster. We need to slow down Left.
-            # To slow down Left, trim must be negative.
-            # So new_trim = current_trim + (avg_z * kp)
+            # To fix this, we need to add negative trim to slow down the Left wheel.
+            # new_trim = current_trim + (avg_z * kp)
             
             new_trim = current_trim + (avg_z * kp)
-            new_trim = max(-0.3, min(0.3, new_trim))
+            new_trim = max(-0.4, min(0.4, new_trim))
             
-            if abs(new_trim - current_trim) < 0.001:
-                logger.info("[Deduction] Trim converged as best it can.")
+            if abs(new_trim - current_trim) < 0.005:
+                logger.info(f"[Deduction] Trim converged as best it can at {current_trim:.3f}. Final drift: {avg_z:.2f} yaw/s")
                 break
                 
             current_trim = new_trim
             logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f} for next attempt.")
             time.sleep(0.5)
             
-        logger.warning(f"[Deduction] Exhausted trim attempts. Settling on {current_trim:.3f}")
+        # If we exit the loop, we either converged to a non-perfect value or exhausted attempts.
+        # We must be pessimistic. If the final drift is still awful (e.g. > 10 deg/s), we must abort.
+        if abs(avg_z) > 10.0:
+            logger.error(f"[Deduction] FAILED: Could not achieve straight-line driving. Drift stuck at {avg_z:.2f} yaw/s.")
+            return StepStatus.FATAL, {}, {}
+
+        logger.warning(f"[Deduction] Exhausted trim attempts, but drift is manageable. Settling on {current_trim:.3f}")
         return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
 
