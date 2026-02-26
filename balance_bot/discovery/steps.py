@@ -311,14 +311,15 @@ class DriveTrimStep(CalibrationStep):
         
         for attempt in range(10):  # More attempts to converge
             hw.wait_for_stability()
-            res = hw.drive_and_measure(power, power, 0.5, trim_override=current_trim)
+            # Test for 1.0 second to allow the robot to actually move and reach steady-state
+            res = hw.drive_and_measure(power, power, 1.0, trim_override=current_trim)
             
             avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
             logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
             
             if abs(avg_z) < 2.0:  # Relaxed acceptable threshold to 2.0 deg/s
-                logger.info("[Deduction] Trim is perfectly acceptable.")
-                return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
+                logger.info(f"[Deduction] Trim {current_trim:.3f} looks acceptable. Moving to Verification Drive.")
+                break
 
             # Proportional adjustment. 
             # If Yaw Z is negative (e.g. -11.4), we are turning Right.
@@ -330,20 +331,25 @@ class DriveTrimStep(CalibrationStep):
             new_trim = max(-0.4, min(0.4, new_trim))
             
             if abs(new_trim - current_trim) < 0.005:
-                logger.info(f"[Deduction] Trim converged as best it can at {current_trim:.3f}. Final drift: {avg_z:.2f} yaw/s")
+                logger.info(f"[Deduction] Trim converged as best it can at {current_trim:.3f}. Final drift: {avg_z:.2f} yaw/s. Moving to Verification Drive.")
                 break
                 
             current_trim = new_trim
             logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f} for next attempt.")
             time.sleep(0.5)
             
-        # If we exit the loop, we either converged to a non-perfect value or exhausted attempts.
-        # We must be pessimistic. If the final drift is still awful (e.g. > 10 deg/s), we must abort.
-        if abs(avg_z) > 10.0:
-            logger.error(f"[Deduction] FAILED: Could not achieve straight-line driving. Drift stuck at {avg_z:.2f} yaw/s.")
+        logger.info(f"[Action] Performing 2.0-second Verification Drive at trim {current_trim:.3f}")
+        hw.wait_for_stability()
+        res = hw.drive_and_measure(power, power, 2.0, trim_override=current_trim)
+        
+        verify_avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+        logger.info(f"[Observation] Verification Drive drift: {verify_avg_z:.2f} yaw/s")
+
+        if abs(verify_avg_z) > 5.0:
+            logger.error(f"[Deduction] FAILED: Verification drive failed. Drift {verify_avg_z:.2f} is unsafe for straight-line movement.")
             return StepStatus.FATAL, {}, {}
 
-        logger.warning(f"[Deduction] Exhausted trim attempts, but drift is manageable. Settling on {current_trim:.3f}")
+        logger.info(f"[Deduction] Trim successfully verified with a long straight drive at {current_trim:.3f}.")
         return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
 
 
