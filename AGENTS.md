@@ -88,6 +88,7 @@ The agent "doesn't have all the answers" (Section 6), so it must use the scienti
 * **Stateless Vacuum:** Process code in a "stateless vacuum," only applying changes that move the code to the target state.
 * **No Stylistic Changes:** Explicitly forbid stylistic changes for the sake of novelty. AI agents will often unnecessarily rewrite functional boilerplate or change variable names while trying to fix a bug, causing regressions in unrelated systems.
 * **Separation of Concerns:** Never mix doc updates with code updates. Lots of agents are working in parallel, and every "extra cleanup" causes a merge conflict.  Stay focused!  If you encounter something bad, log it in a FUTURE_WORK.md file.
+* **Ok to break past configs** If you are splitting a config setting (e.g. trim becomes forward_trim and backwards_trim), don't worry about "migrating" - the bot will be wiped each run anyway.
 
 ## 11. Strict Personal Operational Constraints for AI
 
