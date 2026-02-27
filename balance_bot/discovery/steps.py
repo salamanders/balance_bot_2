@@ -302,55 +302,152 @@ class DriveTrimStep(CalibrationStep):
         return state.trim_verified
 
     def run(self, hw: RobotHardware, config: HardwareConfig, state: LearningState) -> Tuple[StepStatus, Dict[str, Any], Dict[str, Any]]:
-        power = state.min_power_visible + 15.0
-        current_trim = config.trim_bias
+        # Define test speeds relative to min power to overcome friction
+        low_speed = state.min_power_visible + 10.0
+        med_speed = state.min_power_visible + 25.0
+        high_speed = state.min_power_visible + 40.0
         
-        logger.info(f"[Action] Searching for zero-drift straight line trim starting at {current_trim:.3f}")
+        # Cap speeds at 100
+        low_speed = min(100.0, low_speed)
+        med_speed = min(100.0, med_speed)
+        high_speed = min(100.0, high_speed)
 
-        kp = 0.02  # Lower gain to prevent wild oscillation
+        test_speeds = [low_speed, med_speed, high_speed]
+
+        # --- Tune Forward Trim ---
+        current_trim_fwd = config.trim_bias_forward
+        logger.info(f"[Action] Searching for zero-drift Forward trim starting at {current_trim_fwd:.3f}")
         
-        for attempt in range(10):  # More attempts to converge
+        kp = 0.005  # Lower gain to prevent overshoot
+
+        # Use Medium speed for tuning
+        tune_speed = med_speed
+
+        for attempt in range(10):
             hw.wait_for_stability()
-            # Test for 1.0 second to allow the robot to actually move and reach steady-state
-            res = hw.drive_and_measure(power, power, 1.0, trim_override=current_trim)
+            # Tuning drive: 2.0 seconds
+            res = hw.drive_and_measure(tune_speed, tune_speed, 2.0, trim_override=current_trim_fwd)
             
             avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
-            logger.info(f"[Observation] Drift at trim {current_trim:.3f} was {avg_z:.2f} yaw/s")
+            logger.info(f"[Observation] Forward drift at trim {current_trim_fwd:.3f} was {avg_z:.2f} yaw/s")
             
-            if abs(avg_z) < 2.0:  # Relaxed acceptable threshold to 2.0 deg/s
-                logger.info(f"[Deduction] Trim {current_trim:.3f} looks acceptable. Moving to Verification Drive.")
+            if abs(avg_z) < 2.0:
+                logger.info(f"[Deduction] Forward Trim {current_trim_fwd:.3f} looks acceptable.")
                 break
-
-            # Proportional adjustment. 
-            # If Yaw Z is negative (e.g. -11.4), we are turning Right.
-            # This means the Left wheel is driving faster than the Right wheel.
-            # To fix this, we need to add negative trim to slow down the Left wheel.
-            # new_trim = current_trim + (avg_z * kp)
             
-            new_trim = current_trim + (avg_z * kp)
+            # Update trim
+            new_trim = current_trim_fwd + (avg_z * kp)
             new_trim = max(-0.4, min(0.4, new_trim))
             
-            if abs(new_trim - current_trim) < 0.005:
-                logger.info(f"[Deduction] Trim converged as best it can at {current_trim:.3f}. Final drift: {avg_z:.2f} yaw/s. Moving to Verification Drive.")
-                break
-                
-            current_trim = new_trim
-            logger.info(f"[Deduction] Adjusting trim to {new_trim:.3f} for next attempt.")
-            time.sleep(0.5)
+            if abs(new_trim - current_trim_fwd) < 0.005:
+                 logger.info(f"[Deduction] Forward Trim converged as best it can at {current_trim_fwd:.3f}.")
+                 break
+
+            current_trim_fwd = new_trim
+            logger.info(f"[Deduction] Adjusting Forward trim to {new_trim:.3f}")
+
+        # Verify Forward Trim at multiple speeds
+        logger.info(f"[Action] Verifying Forward Trim {current_trim_fwd:.3f} at multiple speeds.")
+        for speed in test_speeds:
+            hw.wait_for_stability()
+            res = hw.drive_and_measure(speed, speed, 4.0, trim_override=current_trim_fwd)
+            verify_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+            logger.info(f"[Observation] Forward Speed {speed:.1f}: drift {verify_z:.2f} yaw/s")
             
-        logger.info(f"[Action] Performing 2.0-second Verification Drive at trim {current_trim:.3f}")
-        hw.wait_for_stability()
-        res = hw.drive_and_measure(power, power, 2.0, trim_override=current_trim)
+            if abs(verify_z) > 5.0:
+                logger.error(f"[Deduction] FAILED: Forward trim verification failed at speed {speed:.1f} (Drift: {verify_z:.2f}).")
+                return StepStatus.FATAL, {}, {}
+
+        # --- Tune Reverse Trim ---
+        current_trim_rev = config.trim_bias_reverse
+        logger.info(f"[Action] Searching for zero-drift Reverse trim starting at {current_trim_rev:.3f}")
         
-        verify_avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
-        logger.info(f"[Observation] Verification Drive drift: {verify_avg_z:.2f} yaw/s")
+        # Use negative medium speed
+        tune_speed_rev = -med_speed
 
-        if abs(verify_avg_z) > 5.0:
-            logger.error(f"[Deduction] FAILED: Verification drive failed. Drift {verify_avg_z:.2f} is unsafe for straight-line movement.")
-            return StepStatus.FATAL, {}, {}
+        for attempt in range(10):
+            hw.wait_for_stability()
+            # Tuning drive: 2.0 seconds
+            res = hw.drive_and_measure(tune_speed_rev, tune_speed_rev, 2.0, trim_override=current_trim_rev)
 
-        logger.info(f"[Deduction] Trim successfully verified with a long straight drive at {current_trim:.3f}.")
-        return StepStatus.SUCCESS, {'trim_bias': current_trim}, {'trim_verified': True}
+            avg_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+            logger.info(f"[Observation] Reverse drift at trim {current_trim_rev:.3f} was {avg_z:.2f} yaw/s")
+
+            if abs(avg_z) < 2.0:
+                 logger.info(f"[Deduction] Reverse Trim {current_trim_rev:.3f} looks acceptable.")
+                 break
+
+            # Update trim.
+            # Note: The logic for trim correction changes in reverse?
+            # Positive trim reduces Right wheel magnitude (makes it less negative -> slower reverse)
+            # Negative trim reduces Left wheel magnitude (makes it less negative -> slower reverse)
+
+            # If drifting Positive Z (Left Turn in forward), means Right is pushing harder (more negative) than Left? Or Left is slower?
+            # Actually, let's stick to the heuristic:
+            # If Z > 0 (Left Turn), we need to Turn Right to correct.
+            # To turn right in Reverse, we need Left Wheel to be "faster" (more negative) or Right Wheel to be "slower" (less negative).
+
+            # Let's rely on the sign.
+            # If drift is Positive (Turning Left), we need to reduce the drift.
+            # In forward: trim += drift * kp. (Pos drift -> Add Pos trim -> Right wheel slows down -> Robot turns Right). Correct.
+            # In reverse: Right wheel is negative. Reducing its magnitude (slowing it down) means making it LESS negative (closer to 0).
+            # "Trim > 0" reduces Right multiplier: right *= (1.0 - trim).
+            # If Right was -100 and trim is 0.1, Right becomes -90. Slower.
+            # So if we are drifting Left (Pos Z) in reverse:
+            # It means Right side is traveling "more" than left side (drawing a larger arc).
+            # So we need to slow down the Right side.
+            # So we need Positive Trim.
+            # So the sign relationship remains: drift is positive -> add positive trim.
+
+            # HOWEVER, does the Gyro Z sign flip when driving in reverse?
+            # A physical Left Turn is a Left Turn regardless of travel direction.
+            # If I drive forward and turn left, Z is Positive.
+            # If I drive backward and turn left (tail swings left?), Z is Positive?
+            # Wait. "Turn Left" while reversing usually means the *front* of the car swings Right, but the path curves Left.
+            # Let's stick to IMU coords. Z+ is counter-clockwise rotation viewed from top.
+            # If robot drives forward and arcs Left (CCW), Z is +. We want to turn CW (Right). reduce Right motor. Trim +.
+            # If robot drives backward and arcs Left (CCW), Z is +. We want to turn CW (Right). reduce Right motor magnitude.
+            # Right motor is negative. right *= (1.0 - trim). |right| decreases.
+            # So yes, the correction formula is likely the same sign: trim += error * kp.
+
+            # BUT, let's look at the sensor.
+            # If I drive backwards and the Right wheel is faster (more negative), the robot will arc...
+            # Left wheel -50, Right wheel -100.
+            # Right side covers more ground. The robot will turn CLOCKWISE (Right) while backing up?
+            # Imagine tank. Right track goes back fast. Left track goes back slow.
+            # The robot spins Clockwise (Z is Negative).
+            # So Drift is Negative.
+            # To fix, we need to slow down Right wheel.
+            # Slowing down Right wheel requires Positive Trim.
+            # So Negative Drift -> Positive Trim.
+            # So trim -= drift * kp.
+            # So the sign IS inverted for reverse.
+
+            new_trim = current_trim_rev - (avg_z * kp)
+            new_trim = max(-0.4, min(0.4, new_trim))
+
+            if abs(new_trim - current_trim_rev) < 0.005:
+                 logger.info(f"[Deduction] Reverse Trim converged as best it can at {current_trim_rev:.3f}.")
+                 break
+
+            current_trim_rev = new_trim
+            logger.info(f"[Deduction] Adjusting Reverse trim to {new_trim:.3f}")
+
+        # Verify Reverse Trim at multiple speeds
+        logger.info(f"[Action] Verifying Reverse Trim {current_trim_rev:.3f} at multiple speeds.")
+        for speed in test_speeds:
+            rev_speed = -speed
+            hw.wait_for_stability()
+            res = hw.drive_and_measure(rev_speed, rev_speed, 4.0, trim_override=current_trim_rev)
+            verify_z = sum(s.gyro_raw.z for s in res.samples) / max(len(res.samples), 1)
+            logger.info(f"[Observation] Reverse Speed {rev_speed:.1f}: drift {verify_z:.2f} yaw/s")
+
+            if abs(verify_z) > 5.0:
+                logger.error(f"[Deduction] FAILED: Reverse trim verification failed at speed {rev_speed:.1f} (Drift: {verify_z:.2f}).")
+                return StepStatus.FATAL, {}, {}
+
+        logger.info(f"[Deduction] Trim successfully verified forwards and backwards. FWD: {current_trim_fwd:.3f}, REV: {current_trim_rev:.3f}")
+        return StepStatus.SUCCESS, {'trim_bias_forward': current_trim_fwd, 'trim_bias_reverse': current_trim_rev}, {'trim_verified': True}
 
 
 class BalancePointStep(CalibrationStep):
