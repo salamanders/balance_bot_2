@@ -169,7 +169,15 @@ class RobotHardware:
         if self.config.motor_left_channel is None or self.config.motor_right_channel is None:
             raise RuntimeError("Motor channels not configured")
 
-        trim = trim_override if trim_override is not None else self.config.trim_bias
+        if trim_override is not None:
+            trim = trim_override
+        else:
+            # Determine direction based on sum of powers
+            # If both are positive or sum is positive, we are moving forward
+            if (left + right) >= 0:
+                trim = self.config.trim_bias_forward
+            else:
+                trim = self.config.trim_bias_reverse
 
         if trim > 0:
             right *= (1.0 - trim)

@@ -17,7 +17,8 @@ class HardwareConfig(BaseModel):
     gyro_offset_y: float = 0.0
     gyro_offset_z: float = 0.0
 
-    trim_bias: float = 0.0  # Power adjustment to correct drift
+    trim_bias_forward: float = 0.0
+    trim_bias_reverse: float = 0.0
 
     def save(self):
         # Mock save functionality
